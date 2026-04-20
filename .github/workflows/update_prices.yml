@@ -16,7 +16,9 @@ on:
         required: false
         default: "false"
         type: choice
-        options: ["false", "true"]
+        options:
+          - "false"
+          - "true"
 
 jobs:
   update-prices:
@@ -32,21 +34,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install selenium beautifulsoup4 mysql-connector-python sshpass
+      - name: Install Python dependencies
+        run: pip install selenium beautifulsoup4 mysql-connector-python
 
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
+      - name: Install sshpass
+        run: sudo apt-get install -y sshpass
 
       - name: Setup SSH tunnel to DB
+        env:
+          SSH_PASS: ${{ secrets.SSH_PASS }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          DB_HOST: ${{ secrets.DB_HOST }}
         run: |
-          sudo apt-get install -y sshpass
-          sshpass -p '${{ secrets.SSH_PASS }}' ssh \
+          sshpass -p "$SSH_PASS" ssh \
             -o StrictHostKeyChecking=no \
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=10 \
-            -L 3307:${{ secrets.DB_HOST }}:3306 \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            -L 3307:$DB_HOST:3306 \
+            $SSH_USER@$SSH_HOST \
             -N -f
           sleep 3
           echo "SSH tunnel ready"
@@ -60,7 +66,13 @@ jobs:
           DB_NAME: ${{ secrets.DB_NAME }}
         run: |
           ARGS=""
-          [ -n "${{ github.event.inputs.start_id }}" ] && ARGS="$ARGS --start-id ${{ github.event.inputs.start_id }}"
-          [ -n "${{ github.event.inputs.limit }}" ]    && ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
-          [ "${{ github.event.inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
+          if [ -n "${{ github.event.inputs.start_id }}" ]; then
+            ARGS="$ARGS --start-id ${{ github.event.inputs.start_id }}"
+          fi
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
           python -u update_prices.py $ARGS
