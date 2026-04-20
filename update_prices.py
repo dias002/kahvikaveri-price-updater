@@ -1,23 +1,25 @@
 """
 update_prices.py — обновление цен Kahvikaveri (donor_id=8)
-Запускается через GitHub Actions. Использует curl_cffi (без Selenium).
+Запускается через GitHub Actions.
 """
 
-import asyncio
 import time
+import random
 import re
 import os
 import argparse
 import mysql.connector
 from bs4 import BeautifulSoup
-from curl_cffi.requests import AsyncSession
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException
 
 RATIO_PRICE = 1.6
 DONOR_ID = 8
-CONCURRENCY = 5
-SLEEP_BETWEEN = 1.0
-BATCH_LOG = 20
-RETRIES = 3
+SLEEP_BETWEEN = 2.0
+CF_WAIT_TIMEOUT = 25
+BATCH_LOG = 10
 
 DB_CONFIG = {
     "host":     os.environ["DB_HOST"],
@@ -27,8 +29,6 @@ DB_CONFIG = {
     "database": os.environ["DB_NAME"],
 }
 
-
-# ── Парсинг ────────────────────────────────────────────────────────────────────
 
 def _extract_float(text):
     text = text.replace(",", ".")
@@ -55,36 +55,43 @@ def parse_price(soup):
     return price_info
 
 
-def parse_item(html):
-    soup = BeautifulSoup(html, "html.parser")
-    published = 1 if soup.find("button", {"name": "add-to-cart"}) else 0
-    price_info = parse_price(soup) if published else {"price": 0.0, "price_old": 0.0, "sale_item": "0"}
-    return published, price_info
+def make_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    driver = webdriver.Chrome(options=options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return driver
 
 
-# ── HTTP ───────────────────────────────────────────────────────────────────────
-
-async def fetch(session, url):
-    for attempt in range(RETRIES):
-        try:
-            r = await session.get(url, timeout=20, impersonate="chrome120")
-            if r.status_code == 200:
-                return r.text
-            if r.status_code in (403, 429):
-                await asyncio.sleep(3 * (attempt + 1))
-                continue
+def get_page(driver, url):
+    driver.get(url)
+    try:
+        WebDriverWait(driver, CF_WAIT_TIMEOUT).until(
+            lambda d: "Just a moment" not in d.title and d.title.strip() != ""
+        )
+    except TimeoutException:
+        if "Just a moment" in driver.title:
+            print(f"  CF timeout: {url}")
             return None
-        except Exception:
-            await asyncio.sleep(2 * (attempt + 1))
-    return None
+    time.sleep(random.uniform(1.0, 2.5))
+    return BeautifulSoup(driver.page_source, "html.parser")
 
-
-# ── БД ────────────────────────────────────────────────────────────────────────
 
 def connect_db():
     for attempt in range(5):
         try:
-            return mysql.connector.connect(**DB_CONFIG)
+            conn = mysql.connector.connect(**DB_CONFIG)
+            return conn
         except Exception as e:
             print(f"  DB попытка {attempt+1}/5: {e}")
             time.sleep(5)
@@ -126,75 +133,89 @@ def set_unpublished(conn, item_id):
     conn.commit()
 
 
-# ── Главный цикл ───────────────────────────────────────────────────────────────
-
-async def run(items, dry_run, conn):
-    total = len(items)
-    updated = price_changed = unpublished = errors = 0
-    sem = asyncio.Semaphore(CONCURRENCY)
-
-    async with AsyncSession() as session:
-
-        async def process(idx, item_id, purchase_url, old_price, old_purchase):
-            nonlocal updated, price_changed, unpublished, errors
-            async with sem:
-                html = await fetch(session, purchase_url)
-                await asyncio.sleep(SLEEP_BETWEEN)
-
-            if not html:
-                errors += 1
-                print(f"[{idx}/{total}] id={item_id} — не удалось загрузить", flush=True)
-                return
-
-            published, price_info = parse_item(html)
-
-            if not published:
-                if not dry_run:
-                    set_unpublished(conn, item_id)
-                unpublished += 1
-                print(f"[{idx}/{total}] id={item_id} — снят с публикации", flush=True)
-                return
-
-            new_purchase = price_info["price"]
-            sale_item = price_info["sale_item"]
-            new_price_old_raw = price_info["price_old"]
-
-            if new_purchase <= 0:
-                errors += 1
-                print(f"[{idx}/{total}] id={item_id} — цена=0, пропускаем", flush=True)
-                return
-
-            new_price = round(new_purchase * RATIO_PRICE, 2)
-            new_price_old = round(new_price_old_raw * RATIO_PRICE, 2) if sale_item == "1" else 0.0
-            changed = abs(float(old_purchase or 0) - new_purchase) > 0.01
-
-            if not dry_run:
-                update_item(conn, item_id, new_price, new_purchase, new_price_old, sale_item, published)
-
-            updated += 1
-            if changed:
-                price_changed += 1
-                print(f"[{idx}/{total}] id={item_id}  {old_purchase} → {new_purchase} EUR | продажа: {new_price}", flush=True)
-            elif idx % BATCH_LOG == 0:
-                print(f"[{idx}/{total}] id={item_id} без изменений ({new_purchase} EUR)", flush=True)
-
-        tasks = [
-            process(idx, item_id, url, old_price, old_purchase)
-            for idx, (item_id, url, old_price, old_purchase) in enumerate(items, 1)
-        ]
-        await asyncio.gather(*tasks)
-
-    return updated, price_changed, unpublished, errors
-
-
 def main(limit=None, dry_run=False, start_id=None):
     conn = connect_db()
     items = get_items(conn, limit, start_id)
     total = len(items)
     print(f"Товаров для обновления: {total}", flush=True)
 
-    updated, price_changed, unpublished, errors = asyncio.run(run(items, dry_run, conn))
-    conn.close()
+    updated = price_changed = unpublished = errors = 0
+    driver = make_driver()
+
+    try:
+        for idx, (item_id, purchase_url, old_price, old_purchase) in enumerate(items, 1):
+            try:
+                soup = get_page(driver, purchase_url)
+
+                if not soup:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    time.sleep(5)
+                    driver = make_driver()
+                    errors += 1
+                    continue
+
+                published = 1 if soup.find("button", {"name": "add-to-cart"}) else 0
+
+                if not published:
+                    if not dry_run:
+                        set_unpublished(conn, item_id)
+                    unpublished += 1
+                    print(f"[{idx}/{total}] id={item_id} — снят с публикации", flush=True)
+                    time.sleep(SLEEP_BETWEEN)
+                    continue
+
+                price_info = parse_price(soup)
+                new_purchase = price_info["price"]
+                sale_item = price_info["sale_item"]
+                new_price_old_raw = price_info["price_old"]
+
+                if new_purchase <= 0:
+                    print(f"[{idx}/{total}] id={item_id} — цена=0, пропускаем", flush=True)
+                    errors += 1
+                    time.sleep(SLEEP_BETWEEN)
+                    continue
+
+                new_price = round(new_purchase * RATIO_PRICE, 2)
+                new_price_old = round(new_price_old_raw * RATIO_PRICE, 2) if sale_item == "1" else 0.0
+                changed = abs(float(old_purchase or 0) - new_purchase) > 0.01
+
+                if not dry_run:
+                    update_item(conn, item_id, new_price, new_purchase, new_price_old, sale_item, published)
+
+                updated += 1
+                if changed:
+                    price_changed += 1
+                    print(f"[{idx}/{total}] id={item_id}  {old_purchase} → {new_purchase} EUR | продажа: {new_price}", flush=True)
+                elif idx % BATCH_LOG == 0:
+                    print(f"[{idx}/{total}] id={item_id} без изменений ({new_purchase} EUR)", flush=True)
+
+            except Exception as e:
+                err = str(e)
+                print(f"[{idx}/{total}] id={item_id} ошибка: {err[:120]}", flush=True)
+                errors += 1
+                if any(x in err for x in ["invalid session id", "no such window", "chrome not reachable"]):
+                    print("  ⟳ Chrome упал, пересоздаём...", flush=True)
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    time.sleep(3)
+                    driver = make_driver()
+                elif any(x in err for x in ["MySQL Connection not available", "Lost connection", "not connected"]):
+                    print("  ⟳ MySQL упал, переподключаемся...", flush=True)
+                    conn = connect_db()
+
+            time.sleep(SLEEP_BETWEEN)
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        conn.close()
 
     print(f"\n{'='*55}", flush=True)
     print(f"Готово. Всего: {total} | Обновлено: {updated} | "
