@@ -58,6 +58,7 @@ jobs:
           echo "SSH tunnel ready"
 
       - name: Run price update
+        id: price_update
         env:
           DB_HOST: "127.0.0.1"
           DB_PORT: "3307"
@@ -75,4 +76,18 @@ jobs:
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi
-          python -u update_prices.py $ARGS
+          python -u update_prices.py $ARGS 2>&1 | tee /tmp/price_output.txt
+
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## Результат обновления цен" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "Товаров|Готово|ошибка|снят с публикации|EUR" /tmp/price_output.txt | tail -50 >> $GITHUB_STEP_SUMMARY || echo "Лог недоступен" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Скрипт завершился с ошибкой! Проверь логи выше."
+          grep -E "ошибка|Error|Traceback" /tmp/price_output.txt | tail -20 || true
