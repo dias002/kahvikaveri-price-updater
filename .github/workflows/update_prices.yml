@@ -23,7 +23,7 @@ on:
 jobs:
   update-prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -35,7 +35,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install selenium beautifulsoup4 mysql-connector-python
+        run: pip install curl_cffi beautifulsoup4 mysql-connector-python
 
       - name: Install sshpass
         run: sudo apt-get install -y sshpass
