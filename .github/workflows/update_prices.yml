@@ -1,0 +1,66 @@
+name: Kahvikaveri — обновление цен
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_id:
+        description: "Начать с ID товара (пусто = с начала)"
+        required: false
+        default: ""
+      limit:
+        description: "Максимум товаров (пусто = все)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run (без записи в БД)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  update-prices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install selenium beautifulsoup4 mysql-connector-python sshpass
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Setup SSH tunnel to DB
+        run: |
+          sudo apt-get install -y sshpass
+          sshpass -p '${{ secrets.SSH_PASS }}' ssh \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -L 3307:${{ secrets.DB_HOST }}:3306 \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            -N -f
+          sleep 3
+          echo "SSH tunnel ready"
+
+      - name: Run price update
+        env:
+          DB_HOST: "127.0.0.1"
+          DB_PORT: "3307"
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: |
+          ARGS=""
+          [ -n "${{ github.event.inputs.start_id }}" ] && ARGS="$ARGS --start-id ${{ github.event.inputs.start_id }}"
+          [ -n "${{ github.event.inputs.limit }}" ]    && ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
+          [ "${{ github.event.inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
+          python -u update_prices.py $ARGS
